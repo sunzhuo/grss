@@ -49,8 +49,20 @@ function doGet() {
               state.interval = state.interval * 1.5;
             }
 
+            // 获取视频时长，过滤掉3分钟以内的短视频
+            var videoIds = playlistResponse.items.map(item => item.snippet.resourceId.videoId).join(',');
+            var detailsResponse = YouTube.Videos.list('contentDetails', { id: videoIds });
+            var durationMap = {};
+            if (detailsResponse.items) {
+              detailsResponse.items.forEach(function(v) {
+                durationMap[v.id] = parseDuration(v.contentDetails.duration);
+              });
+            }
+
             // 更新缓存的视频内容 (只存必要的字段以节省空间)
-            state.cachedVideos = playlistResponse.items.map(item => ({
+            state.cachedVideos = playlistResponse.items
+              .filter(item => (durationMap[item.snippet.resourceId.videoId] || 0) >= 180)
+              .map(item => ({
               title: channel.name + "：" + item.snippet.title,
               link: "https://www.youtube.com/watch?v=" + item.snippet.resourceId.videoId,
               pubDate: new Date(item.snippet.publishedAt).toUTCString()
@@ -89,6 +101,15 @@ function doGet() {
   
   rssXml += '</channel></rss>';
   return ContentService.createTextOutput(rssXml).setMimeType(ContentService.MimeType.RSS);
+}
+
+function parseDuration(iso8601) {
+  var match = iso8601.match(/PT(?:(\d+)H)?(?:(\d+)M)?(?:(\d+)S)?/);
+  if (!match) return 0;
+  var hours = parseInt(match[1] || 0);
+  var minutes = parseInt(match[2] || 0);
+  var seconds = parseInt(match[3] || 0);
+  return hours * 3600 + minutes * 60 + seconds;
 }
 
 function escapeXml(unsafe) {
