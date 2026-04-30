@@ -60,7 +60,7 @@ function doGet() {
     channels.forEach(function(channel) {
       var propKey = "state_" + channel.id;
       var stateRaw = props.getProperty(propKey);
-      var state = stateRaw ? JSON.parse(stateRaw) : { interval: 4, nextCheck: 0, lastVideoId: "", cachedVideos: [] };
+      var state = stateRaw ? JSON.parse(stateRaw) : { interval: 4, nextCheck: 0, lastVideoId: "", lastPublishedAt: 0, avgUploadGapDays: 30, inactiveScore: 0, status: "new", cachedVideos: [] };
 
       // 情况 A: 到期了，去 YouTube 抓取
       if (now >= state.nextCheck) {
@@ -74,11 +74,34 @@ function doGet() {
             var latestVideoId = playlistResponse.items[0].snippet.resourceId.videoId;
 
             // 频率调整逻辑
+            var latestPublishedAt = new Date(playlistResponse.items[0].snippet.publishedAt).getTime();
+
             if (latestVideoId !== state.lastVideoId) {
+              // 有新视频：更新频道活跃信息，并收缩检查间隔
+              if (state.lastPublishedAt && latestPublishedAt < state.lastPublishedAt) {
+                var gapDays = Math.max(1, (state.lastPublishedAt - latestPublishedAt) / 86400000);
+                state.avgUploadGapDays = (state.avgUploadGapDays * 0.7) + (gapDays * 0.3);
+              }
               state.lastVideoId = latestVideoId;
-              state.interval = 2; 
+              state.lastPublishedAt = latestPublishedAt;
+              state.inactiveScore = 0;
+              state.status = "active";
+              state.interval = 2;
             } else {
-              state.interval = state.interval * 1.5;
+              // 无新视频：根据最近发布时间与历史更新节奏，区分“长周期活跃”与“疑似停更”
+              var ageDays = Math.max(0, (now - latestPublishedAt) / 86400000);
+              var expectedGap = Math.max(7, state.avgUploadGapDays || 30);
+              var inactiveThreshold = Math.max(180, expectedGap * 3); // 至少 180 天再判疑似停更
+
+              if (ageDays >= inactiveThreshold) {
+                state.status = "inactive_suspected";
+                state.inactiveScore = (state.inactiveScore || 0) + 1;
+                state.interval = Math.min(state.interval * 1.8, 24 * 7); // 疑似停更：最多每 7 天查一次
+              } else {
+                state.status = "long_cycle_active";
+                state.inactiveScore = 0;
+                state.interval = Math.min(state.interval * 1.3, 24); // 长周期但活跃：查询最长间隔 1 天
+              }
             }
 
             // 获取视频时长，过滤掉3分钟(180秒)以内的短视频
@@ -205,7 +228,7 @@ function checkChannelStats() {
         intervalNum: state.interval,
         intervalText: intervalHours + " 小时",
         nextCheck: nextCheckDate,
-        status: status,
+        status: status + (state.status ? " / " + state.status : ""),
         cachedCount: state.cachedVideos ? state.cachedVideos.length : 0
       });
     } else {
