@@ -3,19 +3,22 @@ function doGet() {
   var now = new Date().getTime();
   var rssItems = [];
 
+  // 时间常量定义
+  var ONE_YEAR_MS = 365 * 24 * 60 * 60 * 1000; // 365天
+  var ONE_MONTH_MS = 30 * 24 * 60 * 60 * 1000; // 30天
+
   try {
     // ==========================================
-    // --- 步骤 1: 智能获取/更新频道列表 (进阶版) ---
+    // --- 步骤 1: 智能获取/更新频道列表 ---
     // ==========================================
     var cachedChannelsRaw = props.getProperty('cached_channels');
     var lastSyncList = parseInt(props.getProperty('last_sync_list') || 0);
-    // 初始化为 -1 是为了防止第一次运行时 currentSubCount 为 0 导致误判为未更改
     var lastSubCount = parseInt(props.getProperty('last_sub_count') || -1); 
     var lastFirstChannelId = props.getProperty('last_first_channel_id') || "";
 
     var channels = [];
 
-    // 1. 极速探测：只拉取 1 条数据，获取“订阅总数”和“列表第一个(最新)频道ID”
+    // 1. 极速探测
     var quickCheck = YouTube.Subscriptions.list('snippet', { mine: true, maxResults: 1 });
     var currentSubCount = quickCheck.pageInfo ? quickCheck.pageInfo.totalResults : 0;
     var currentFirstChannelId = (quickCheck.items && quickCheck.items.length > 0) 
@@ -23,10 +26,10 @@ function doGet() {
                                 : "";
 
     // 2. 核心逻辑：判断是否需要触发全量更新
-    var needsUpdate = !cachedChannelsRaw ||                                 // 情况1：完全没有缓存（第一次运行）
-                      currentSubCount !== lastSubCount ||                   // 情况2：订阅总数量发生了变化
-                      currentFirstChannelId !== lastFirstChannelId ||       // 情况3：数量没变，但最新订阅的频道换了 (一增一减)
-                      (now - lastSyncList > 2592000000);                    // 情况4：超过30天，强制全量同步一次作为兜底
+    var needsUpdate = !cachedChannelsRaw ||                                 
+                      currentSubCount !== lastSubCount ||                   
+                      currentFirstChannelId !== lastFirstChannelId ||       
+                      (now - lastSyncList > 2592000000);                    
 
     if (needsUpdate) {
       console.log("检测到订阅列表变化或缓存过期，开始全量同步...");
@@ -50,113 +53,73 @@ function doGet() {
       props.setProperty('last_sub_count', currentSubCount.toString());
       props.setProperty('last_first_channel_id', currentFirstChannelId);
     } else {
-      // 如果没有任何变化，直接从缓存瞬间读取
       channels = JSON.parse(cachedChannelsRaw);
     }
 
     // ==========================================
-    // --- 步骤 2: 遍历频道并执行自适应检查 ---
+    // --- 步骤 2: 遍历频道并应用“僵尸频道”过滤策略 ---
     // ==========================================
     channels.forEach(function(channel) {
-      var propKey = "state_" + channel.id;
-      var stateRaw = props.getProperty(propKey);
-      var state = stateRaw ? JSON.parse(stateRaw) : { interval: 4, nextCheck: 0, lastVideoId: "", lastPublishedAt: 0, avgUploadGapDays: 30, inactiveScore: 0, status: "new", cachedVideos: [] };
+      var stateKey = "state_" + channel.id;
+      var stateRaw = props.getProperty(stateKey);
+      var state = stateRaw ? JSON.parse(stateRaw) : { status: "active", lastCheckTime: 0 };
 
-      // 兼容历史缓存：老状态可能没有 status，且 interval 可能已经被放大到 >24h
-      if (!state.status) {
-        state.status = "legacy_unclassified";
-      }
-      if (state.status !== "inactive_suspected" && state.interval > 24) {
-        state.interval = 24;
-        if (state.nextCheck > now + 24 * 3600000) {
-          state.nextCheck = now + 24 * 3600000;
-        }
-        props.setProperty(propKey, JSON.stringify(state));
+      // 【核心过滤】如果是僵尸频道，且距离上次检查不到一个月，直接跳过 API 请求
+      if (state.status === "zombie" && (now - state.lastCheckTime < ONE_MONTH_MS)) {
+        return; 
       }
 
-      // 兼容历史缓存：老状态可能没有 status，且 interval 可能已经被放大到 >24h
-      if (!state.status) {
-        state.status = "legacy_unclassified";
-      }
-      if (state.status !== "inactive_suspected" && state.interval > 24) {
-        state.interval = 24;
-        if (state.nextCheck > now + 24 * 3600000) {
-          state.nextCheck = now + 24 * 3600000;
-        }
-        props.setProperty(propKey, JSON.stringify(state));
-      }
-
-      // 情况 A: 每次调用都抓取该频道最新视频（不再按时间间隔跳过）
       try {
-          var uploadsPlaylistId = "UU" + channel.id.substring(2);
-          var playlistResponse = YouTube.PlaylistItems.list('snippet', {
-            playlistId: uploadsPlaylistId, maxResults: 3
-          });
+        var uploadsPlaylistId = "UU" + channel.id.substring(2);
+        var playlistResponse = YouTube.PlaylistItems.list('snippet', {
+          playlistId: uploadsPlaylistId, maxResults: 3
+        });
 
-          if (playlistResponse.items && playlistResponse.items.length > 0) {
-            var latestVideoId = playlistResponse.items[0].snippet.resourceId.videoId;
+        // 只要请求了 API，就更新检查时间
+        state.lastCheckTime = now; 
 
-            // 频率调整逻辑
-            var latestPublishedAt = new Date(playlistResponse.items[0].snippet.publishedAt).getTime();
+        if (playlistResponse.items && playlistResponse.items.length > 0) {
+          var latestPublishedAt = new Date(playlistResponse.items[0].snippet.publishedAt).getTime();
+          
+          // 【状态判定】判断最新视频是否是一年前发布的
+          if (now - latestPublishedAt > ONE_YEAR_MS) {
+            state.status = "zombie";
+          } else {
+            state.status = "active";
+          }
 
-            if (latestVideoId !== state.lastVideoId) {
-              // 有新视频：更新频道活跃信息，并收缩检查间隔
-              if (state.lastPublishedAt && latestPublishedAt < state.lastPublishedAt) {
-                var gapDays = Math.max(1, (state.lastPublishedAt - latestPublishedAt) / 86400000);
-                state.avgUploadGapDays = (state.avgUploadGapDays * 0.7) + (gapDays * 0.3);
-              }
-              state.lastVideoId = latestVideoId;
-              state.lastPublishedAt = latestPublishedAt;
-              state.inactiveScore = 0;
-              state.status = "active";
-              state.interval = 2;
-            } else {
-              // 无新视频：根据最近发布时间与历史更新节奏，区分“长周期活跃”与“疑似停更”
-              var ageDays = Math.max(0, (now - latestPublishedAt) / 86400000);
-              var expectedGap = Math.max(7, state.avgUploadGapDays || 30);
-              var inactiveThreshold = Math.max(180, expectedGap * 3); // 至少 180 天再判疑似停更
+          // 获取视频时长，过滤掉3分钟以内的短视频
+          var videoIds = playlistResponse.items.map(item => item.snippet.resourceId.videoId).join(',');
+          var detailsResponse = YouTube.Videos.list('contentDetails', { id: videoIds });
+          var durationMap = {};
+          
+          if (detailsResponse.items) {
+            detailsResponse.items.forEach(function(v) {
+              durationMap[v.id] = parseDuration(v.contentDetails.duration);
+            });
+          }
 
-              if (ageDays >= inactiveThreshold) {
-                state.status = "inactive_suspected";
-                state.inactiveScore = (state.inactiveScore || 0) + 1;
-                state.interval = Math.min(state.interval * 1.8, 24 * 7); // 疑似停更：最多每 7 天查一次
-              } else {
-                state.status = "long_cycle_active";
-                state.inactiveScore = 0;
-                state.interval = Math.min(state.interval * 1.3, 24); // 长周期但活跃：查询最长间隔 1 天
-              }
-            }
-
-            // 获取视频时长，过滤掉3分钟(180秒)以内的短视频
-            var videoIds = playlistResponse.items.map(item => item.snippet.resourceId.videoId).join(',');
-            var detailsResponse = YouTube.Videos.list('contentDetails', { id: videoIds });
-            var durationMap = {};
-            if (detailsResponse.items) {
-              detailsResponse.items.forEach(function(v) {
-                durationMap[v.id] = parseDuration(v.contentDetails.duration);
+          // 如果频道有视频（不管是不是僵尸，都推入池子参与按时间排序）
+          playlistResponse.items.forEach(function(item) {
+            var vid = item.snippet.resourceId.videoId;
+            if ((durationMap[vid] || 0) >= 180) {
+              rssItems.push({
+                title: channel.name + "：" + item.snippet.title,
+                link: "https://www.youtube.com/watch?v=" + vid,
+                pubDate: new Date(item.snippet.publishedAt).toUTCString()
               });
             }
+          });
+        } else {
+          // 如果频道完全没有任何视频，也归类为僵尸频道
+          state.status = "zombie";
+        }
+        
+        // 将频道最新状态写回缓存
+        props.setProperty(stateKey, JSON.stringify(state));
 
-            // 更新缓存的视频内容 (只存必要的字段以节省空间)
-            state.cachedVideos = playlistResponse.items
-              .filter(item => (durationMap[item.snippet.resourceId.videoId] || 0) >= 180)
-              .map(item => ({
-              title: channel.name + "：" + item.snippet.title,
-              link: "https://www.youtube.com/watch?v=" + item.snippet.resourceId.videoId,
-              pubDate: new Date(item.snippet.publishedAt).toUTCString()
-            }));
-
-            state.nextCheck = now + (state.interval * 3600000);
-            props.setProperty(propKey, JSON.stringify(state));
-          }
       } catch (e) { 
-          // 频道可能被封禁或删除，静默跳过
-          console.log("跳过失效频道: " + channel.name); 
-      }
-
-      // 情况 B: 无论是否到期，都把该频道缓存中的视频加入 RSS 列表
-      if (state.cachedVideos && state.cachedVideos.length > 0) {
-        rssItems = rssItems.concat(state.cachedVideos);
+        console.log("跳过失效频道: " + channel.name); 
       }
     });
 
@@ -165,14 +128,13 @@ function doGet() {
   }
 
   // ==========================================
-  // --- 步骤 3: 排序并输出 RSS (限制总数，防止 XML 过大) ---
+  // --- 步骤 3: 排序并输出 RSS ---
   // ==========================================
   rssItems.sort((a, b) => new Date(b.pubDate) - new Date(a.pubDate));
-  // 只取最新的 50 条视频显示在 RSS 中
   var finalItems = rssItems.slice(0, 50);
 
   var rssXml = '<?xml version="1.0" encoding="UTF-8" ?><rss version="2.0"><channel>';
-  rssXml += '<title>YouTube 极致自适应聚合</title><link>https://www.youtube.com</link>';
+  rssXml += '<title>YouTube 订阅 (带僵尸频道休眠优化)</title><link>https://www.youtube.com</link>';
   
   finalItems.forEach(function(item) {
     rssXml += '<item><title>' + escapeXml(item.title) + '</title>';
@@ -203,8 +165,7 @@ function escapeXml(unsafe) {
 }
 
 /**
- * 运行此函数来清空所有缓存，强制脚本重新开始
- * 在 GAS 编辑器中选择此函数并点击"运行"即可
+ * 运行此函数来清空频道列表缓存
  */
 function emergencyReset() {
   var props = PropertiesService.getScriptProperties();
@@ -213,75 +174,61 @@ function emergencyReset() {
 }
 
 /**
- * 辅助函数：在控制台打印所有频道的当前更新频率和下次检查时间
+ * 查询所有频道状态（僵尸/活跃）的统计报告
  * 在 GAS 编辑器中选择此函数并点击"运行"即可查看日志
  */
-function checkChannelStats() {
+function printChannelStatus() {
   var props = PropertiesService.getScriptProperties();
   var cachedChannelsRaw = props.getProperty('cached_channels');
   
   if (!cachedChannelsRaw) {
-    console.log("❌ 尚未生成频道缓存，请先运行一次 doGet() 或等待触发器执行。");
+    console.log("❌ 尚未生成频道列表缓存。请先访问一次你的 Web 应用链接触发抓取。");
     return;
   }
   
   var channels = JSON.parse(cachedChannelsRaw);
   var now = new Date().getTime();
-  var stats = [];
+  var activeCount = 0;
+  var zombieCount = 0;
   
-  console.log("📊 === 频道更新频率及状态报告 ===");
-  console.log("总计订阅频道数: " + channels.length);
-  console.log("--------------------------------------------------");
+  console.log("📊 === 频道更新状态报告 ===");
   
-  // 遍历所有频道，收集它们的状态信息
   channels.forEach(function(channel) {
     var stateRaw = props.getProperty("state_" + channel.id);
+    var status = "active"; // 默认新建频道当作活跃处理
+    var nextCheckText = "每次运行均检查";
     
     if (stateRaw) {
       var state = JSON.parse(stateRaw);
-      var intervalHours = state.interval.toFixed(2); // 保留两位小数
-      // 格式化下次检查时间
-      var nextCheckDate = state.nextCheck > 0 ? new Date(state.nextCheck).toLocaleString() : "立刻";
-      // 判断当前状态
-      var status = (now >= state.nextCheck) ? "🟢 等待抓取" : "⏳ 冷却中";
+      status = state.status || "active";
       
-      stats.push({
-        name: channel.name,
-        intervalNum: state.interval,
-        intervalText: intervalHours + " 小时",
-        nextCheck: nextCheckDate,
-        status: status + (state.status ? " / " + state.status : ""),
-        cachedCount: state.cachedVideos ? state.cachedVideos.length : 0
-      });
+      if (status === "zombie") {
+        var nextCheckTime = state.lastCheckTime + (30 * 24 * 60 * 60 * 1000);
+        if (nextCheckTime > now) {
+          var daysLeft = ((nextCheckTime - now) / (1000 * 60 * 60 * 24)).toFixed(1);
+          nextCheckText = "休眠中，" + daysLeft + " 天后复查";
+        } else {
+          nextCheckText = "立刻检查 (休眠期已满)";
+        }
+      }
+    }
+    
+    if (status === "zombie") {
+      zombieCount++;
+      console.log("🧟 [僵尸频道] " + channel.name + " | 状态: " + nextCheckText);
     } else {
-      stats.push({
-        name: channel.name,
-        intervalNum: 9999, // 设为极大值，排在最后
-        intervalText: "尚未初始化",
-        nextCheck: "-",
-        status: "⚪ 未处理",
-        cachedCount: 0
-      });
+      activeCount++;
+      console.log("🟢 [活跃频道] " + channel.name + " | 状态: " + nextCheckText);
     }
   });
   
-  // 为了方便查看，按照检查频率（间隔时间）从短到长进行排序
-  // 更新最频繁（最活跃）的频道会排在最上面
-  stats.sort((a, b) => a.intervalNum - b.intervalNum);
+  console.log("--------------------------------------------------");
+  console.log("总计订阅数: " + channels.length);
+  console.log("🟢 活跃频道: " + activeCount + " 个 (每次获取耗费 2 点配额)");
+  console.log("🧟 僵尸频道: " + zombieCount + " 个 (仅每月获取时耗费配额)");
   
-  // 输出到日志
-  stats.forEach(function(s, index) {
-    var logStr = Utilities.formatString(
-      "%03d. [%s] \n    ⏱ 检查间隔: %-8s | 📦 缓存视频: %-2d | 状态: %s | 下次检查: %s",
-      index + 1, 
-      s.name, 
-      s.intervalText, 
-      s.cachedCount, 
-      s.status, 
-      s.nextCheck
-    );
-    console.log(logStr);
-  });
-  
+  // 帮你预估当前的单次配额消耗
+  var currentCost = 1 + (activeCount * 2);
+  console.log("💡 预估当前每次触发脚本消耗配额: " + currentCost + " 点 / 10000 点");
   console.log("==================================================");
 }
