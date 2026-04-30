@@ -74,6 +74,18 @@ function doGet() {
         props.setProperty(propKey, JSON.stringify(state));
       }
 
+      // 兼容历史缓存：老状态可能没有 status，且 interval 可能已经被放大到 >24h
+      if (!state.status) {
+        state.status = "legacy_unclassified";
+      }
+      if (state.status !== "inactive_suspected" && state.interval > 24) {
+        state.interval = 24;
+        if (state.nextCheck > now + 24 * 3600000) {
+          state.nextCheck = now + 24 * 3600000;
+        }
+        props.setProperty(propKey, JSON.stringify(state));
+      }
+
       // 情况 A: 每次调用都抓取该频道最新视频（不再按时间间隔跳过）
       try {
           var uploadsPlaylistId = "UU" + channel.id.substring(2);
