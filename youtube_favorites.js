@@ -62,6 +62,18 @@ function doGet() {
       var stateRaw = props.getProperty(propKey);
       var state = stateRaw ? JSON.parse(stateRaw) : { interval: 4, nextCheck: 0, lastVideoId: "", lastPublishedAt: 0, avgUploadGapDays: 30, inactiveScore: 0, status: "new", cachedVideos: [] };
 
+      // 兼容历史缓存：老状态可能没有 status，且 interval 可能已经被放大到 >24h
+      if (!state.status) {
+        state.status = "legacy_unclassified";
+      }
+      if (state.status !== "inactive_suspected" && state.interval > 24) {
+        state.interval = 24;
+        if (state.nextCheck > now + 24 * 3600000) {
+          state.nextCheck = now + 24 * 3600000;
+        }
+        props.setProperty(propKey, JSON.stringify(state));
+      }
+
       // 情况 A: 到期了，去 YouTube 抓取
       if (now >= state.nextCheck) {
         try {
