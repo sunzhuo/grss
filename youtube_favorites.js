@@ -74,9 +74,20 @@ function doGet() {
         props.setProperty(propKey, JSON.stringify(state));
       }
 
-      // 情况 A: 到期了，去 YouTube 抓取
-      if (now >= state.nextCheck) {
-        try {
+      // 兼容历史缓存：老状态可能没有 status，且 interval 可能已经被放大到 >24h
+      if (!state.status) {
+        state.status = "legacy_unclassified";
+      }
+      if (state.status !== "inactive_suspected" && state.interval > 24) {
+        state.interval = 24;
+        if (state.nextCheck > now + 24 * 3600000) {
+          state.nextCheck = now + 24 * 3600000;
+        }
+        props.setProperty(propKey, JSON.stringify(state));
+      }
+
+      // 情况 A: 每次调用都抓取该频道最新视频（不再按时间间隔跳过）
+      try {
           var uploadsPlaylistId = "UU" + channel.id.substring(2);
           var playlistResponse = YouTube.PlaylistItems.list('snippet', {
             playlistId: uploadsPlaylistId, maxResults: 3
@@ -138,10 +149,9 @@ function doGet() {
             state.nextCheck = now + (state.interval * 3600000);
             props.setProperty(propKey, JSON.stringify(state));
           }
-        } catch (e) { 
+      } catch (e) { 
           // 频道可能被封禁或删除，静默跳过
           console.log("跳过失效频道: " + channel.name); 
-        }
       }
 
       // 情况 B: 无论是否到期，都把该频道缓存中的视频加入 RSS 列表
